@@ -177,14 +177,7 @@ namespace
 
     bool InstallHook()
     {
-        HMODULE clientModule = nullptr;
-        for (int attempt = 0; attempt < 300 && clientModule == nullptr; ++attempt)
-        {
-            clientModule = GetModuleHandleW(L"client.dll");
-            if (clientModule == nullptr)
-                Sleep(100);
-        }
-
+        const HMODULE clientModule = GetModuleHandleW(L"client.dll");
         if (clientModule == nullptr)
             return false;
 
