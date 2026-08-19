@@ -57,6 +57,7 @@ namespace
         float zFar;
         float viewModelZNear;
         float viewModelZFar;
+        bool renderToSubrectOfLargerScreen;
         float aspectRatio;
         bool offCenter;
         float offCenterTop;
@@ -68,6 +69,10 @@ namespace
         bool viewToProjectionOverride;
         VMatrix viewToProjection;
     };
+
+    static_assert(
+        sizeof(CViewSetup) == 200,
+        "CViewSetup must match the current 64-bit Garry's Mod SDK layout.");
 
     enum class ViewMode : std::uint8_t
     {
@@ -146,6 +151,8 @@ namespace
         secondary.height = (std::max)(1, view.height / 2);
         secondary.unscaledHeight = secondary.height;
         secondary.stereoEye = StereoEye::Mono;
+        secondary.renderToSubrectOfLargerScreen = true;
+        secondary.aspectRatio = 0.0f;
         secondary.angles.y = NormalizeYaw(
             view.angles.y + (mode == ViewMode::Rear ? -180.0f : -90.0f));
 
