@@ -5,7 +5,7 @@
 #include <cstdint>
 
 #ifndef _WIN64
-#error This test targets the 64-bit Garry's Mod client.
+#error This test targets the 64-bit Garrys Mod client.
 #endif
 
 namespace
@@ -32,7 +32,7 @@ namespace
         Count
     };
 
-    // Layout copied from ExempleSDK/client/CViewSetup.h.
+    // Layout from the current GMod-compatible sourcesdk-minimal/view_shared.h.
     struct CViewSetup
     {
         int x;
@@ -81,24 +81,37 @@ namespace
         Left
     };
 
-    using CreateInterfaceFn = void* (__cdecl*)(const char*, int*);
-    using RenderViewFn = void(__fastcall*)(void*, const CViewSetup&, int, int);
+    struct VRect
+    {
+        int x;
+        int y;
+        int width;
+        int height;
+        VRect* next;
+    };
 
+    using CreateInterfaceFn = void* (__cdecl*)(const char*, int*);
+    using ViewRenderFn = void(__fastcall*)(void*, VRect*);
+    using RenderViewFn = void(__fastcall*)(void*, const CViewSetup&, int, int);
+    using GetPlayerViewFn = bool(__fastcall*)(void*, CViewSetup&);
+
+    constexpr std::size_t kViewRenderIndex = 26;
     constexpr std::size_t kRenderViewIndex = 27;
+    constexpr std::size_t kGetPlayerViewIndex = 59;
 
     constexpr int kViewClearColor = 1 << 0;
     constexpr int kViewClearDepth = 1 << 1;
     constexpr int kViewClearStencil = 1 << 5;
 
-    constexpr int kRenderViewDrawViewModel = 1 << 0;
-    constexpr int kRenderViewDrawHud = 1 << 1;
+    constexpr int kRenderViewSuppressMonitorRendering = 1 << 2;
 
     // Rear view is enabled by default for the first runtime diagnostic.
     std::atomic<ViewMode> g_viewMode{ ViewMode::Rear };
-    std::atomic<std::uint64_t> g_renderViewCalls{ 0 };
-    RenderViewFn g_originalRenderView = nullptr;
-    void** g_renderViewSlot = nullptr;
-    thread_local bool g_renderingSecondaryView = false;
+    std::atomic<std::uint64_t> g_viewRenderCalls{ 0 };
+    ViewRenderFn g_originalViewRender = nullptr;
+    RenderViewFn g_renderView = nullptr;
+    GetPlayerViewFn g_getPlayerView = nullptr;
+    void** g_viewRenderSlot = nullptr;
 
     void UpdateViewMode()
     {
@@ -123,20 +136,18 @@ namespace
         return yaw;
     }
 
-    void __fastcall HookedRenderView(
-        void* client,
-        const CViewSetup& view,
-        int clearFlags,
-        int whatToDraw)
+    void __fastcall HookedViewRender(void* client, VRect* rect)
     {
-        const RenderViewFn original = g_originalRenderView;
-        if (original == nullptr)
+        const ViewRenderFn original = g_originalViewRender;
+        const RenderViewFn renderView = g_renderView;
+        const GetPlayerViewFn getPlayerView = g_getPlayerView;
+        if (original == nullptr || renderView == nullptr || getPlayerView == nullptr)
             return;
 
-        original(client, view, clearFlags, whatToDraw);
-        g_renderViewCalls.fetch_add(1, std::memory_order_relaxed);
+        original(client, rect);
+        g_viewRenderCalls.fetch_add(1, std::memory_order_relaxed);
 
-        if (g_renderingSecondaryView)
+        if (rect == nullptr || rect->width <= 0 || rect->height <= 0)
             return;
 
         UpdateViewMode();
@@ -144,30 +155,33 @@ namespace
         if (mode == ViewMode::Off)
             return;
 
-        CViewSetup secondary = view;
+        CViewSetup secondary{};
+        if (!getPlayerView(client, secondary))
+            return;
+
         secondary.x = 275;
         secondary.unscaledX = secondary.x;
         secondary.y = 535;
         secondary.unscaledY = secondary.y;
-        secondary.width = (std::max)(1, static_cast<int>(view.width / 1.4f));
+        secondary.width = (std::max)(1, static_cast<int>(secondary.width / 1.4f));
         secondary.unscaledWidth = secondary.width;
-        secondary.height = (std::max)(1, view.height / 2);
+        secondary.height = (std::max)(1, secondary.height / 2);
         secondary.unscaledHeight = secondary.height;
         secondary.stereoEye = StereoEye::Mono;
         secondary.renderToSubrectOfLargerScreen = true;
         secondary.aspectRatio = 0.0f;
         secondary.angles.y = NormalizeYaw(
-            view.angles.y + (mode == ViewMode::Rear ? -180.0f : -90.0f));
+            secondary.angles.y + (mode == ViewMode::Rear ? -180.0f : -90.0f));
 
         // Do not draw the first-person hands or a second HUD in the inset.
-        const int secondaryDrawFlags =
-            whatToDraw & ~(kRenderViewDrawViewModel | kRenderViewDrawHud);
         const int secondaryClearFlags =
             kViewClearColor | kViewClearDepth | kViewClearStencil;
 
-        g_renderingSecondaryView = true;
-        original(client, secondary, secondaryClearFlags, secondaryDrawFlags);
-        g_renderingSecondaryView = false;
+        renderView(
+            client,
+            secondary,
+            secondaryClearFlags,
+            kRenderViewSuppressMonitorRendering);
     }
 
     bool ReplaceVTableEntry(void** slot, void* expected, void* replacement)
@@ -204,24 +218,31 @@ namespace
         if (vtable == nullptr)
             return false;
 
-        g_renderViewSlot = &vtable[kRenderViewIndex];
-        void* original = *g_renderViewSlot;
-        if (original == nullptr)
+        g_viewRenderSlot = &vtable[kViewRenderIndex];
+        void* original = *g_viewRenderSlot;
+        g_renderView = reinterpret_cast<RenderViewFn>(vtable[kRenderViewIndex]);
+        g_getPlayerView =
+            reinterpret_cast<GetPlayerViewFn>(vtable[kGetPlayerViewIndex]);
+        if (original == nullptr || g_renderView == nullptr || g_getPlayerView == nullptr)
         {
-            g_renderViewSlot = nullptr;
+            g_viewRenderSlot = nullptr;
+            g_renderView = nullptr;
+            g_getPlayerView = nullptr;
             return false;
         }
 
         // Publish the original before installing the hook so a render thread
         // can never observe the hook with a null forwarding target.
-        g_originalRenderView = reinterpret_cast<RenderViewFn>(original);
+        g_originalViewRender = reinterpret_cast<ViewRenderFn>(original);
         if (!ReplaceVTableEntry(
-                g_renderViewSlot,
+                g_viewRenderSlot,
                 original,
-                reinterpret_cast<void*>(&HookedRenderView)))
+                reinterpret_cast<void*>(&HookedViewRender)))
         {
-            g_renderViewSlot = nullptr;
-            g_originalRenderView = nullptr;
+            g_viewRenderSlot = nullptr;
+            g_originalViewRender = nullptr;
+            g_renderView = nullptr;
+            g_getPlayerView = nullptr;
             return false;
         }
         return true;
@@ -229,12 +250,12 @@ namespace
 
     void RemoveHook()
     {
-        if (g_renderViewSlot == nullptr || g_originalRenderView == nullptr)
+        if (g_viewRenderSlot == nullptr || g_originalViewRender == nullptr)
             return;
 
         DWORD oldProtection = 0;
         if (!VirtualProtect(
-                g_renderViewSlot,
+                g_viewRenderSlot,
                 sizeof(void*),
                 PAGE_EXECUTE_READWRITE,
                 &oldProtection))
@@ -242,21 +263,23 @@ namespace
             return;
         }
 
-        if (*g_renderViewSlot == reinterpret_cast<void*>(&HookedRenderView))
+        if (*g_viewRenderSlot == reinterpret_cast<void*>(&HookedViewRender))
         {
             InterlockedExchangePointer(
-                reinterpret_cast<void* volatile*>(g_renderViewSlot),
-                reinterpret_cast<void*>(g_originalRenderView));
+                reinterpret_cast<void* volatile*>(g_viewRenderSlot),
+                reinterpret_cast<void*>(g_originalViewRender));
         }
 
         DWORD ignored = 0;
         VirtualProtect(
-            g_renderViewSlot, sizeof(void*), oldProtection, &ignored);
+            g_viewRenderSlot, sizeof(void*), oldProtection, &ignored);
         FlushInstructionCache(
-            GetCurrentProcess(), g_renderViewSlot, sizeof(void*));
+            GetCurrentProcess(), g_viewRenderSlot, sizeof(void*));
 
-        g_renderViewSlot = nullptr;
-        g_originalRenderView = nullptr;
+        g_viewRenderSlot = nullptr;
+        g_originalViewRender = nullptr;
+        g_renderView = nullptr;
+        g_getPlayerView = nullptr;
     }
 
     DWORD WINAPI Initialize(void*)
@@ -265,16 +288,16 @@ namespace
         {
             MessageBoxA(
                 nullptr,
-                "VClient017 a ete trouve et l'entree RenderView 27 a ete accrochee.",
+                "VClient017 a ete trouve et l'entree View_Render 26 a ete accrochee.",
                 "TestDll - etape 1/2",
                 MB_OK | MB_ICONINFORMATION);
 
             Sleep(250);
-            if (g_renderViewCalls.load(std::memory_order_relaxed) != 0)
+            if (g_viewRenderCalls.load(std::memory_order_relaxed) != 0)
             {
                 MessageBoxA(
                     nullptr,
-                    "Le hook RenderView recoit bien les appels du moteur.\n"
+                    "Le hook View_Render recoit bien les appels du moteur.\n"
                     "La vue arriere est activee par defaut pour ce test.",
                     "TestDll - etape 2/2",
                     MB_OK | MB_ICONINFORMATION);
@@ -283,7 +306,7 @@ namespace
             {
                 MessageBoxA(
                     nullptr,
-                    "La vtable a ete modifiee, mais RenderView n'a recu aucun appel.",
+                    "La vtable a ete modifiee, mais View_Render n'a recu aucun appel.",
                     "TestDll - diagnostic",
                     MB_OK | MB_ICONWARNING);
             }
@@ -292,7 +315,7 @@ namespace
         {
             MessageBoxA(
                 nullptr,
-                "Echec de l'installation du hook VClient017::RenderView.",
+                "Echec de l'installation du hook VClient017::View_Render.",
                 "TestDll - erreur",
                 MB_OK | MB_ICONERROR);
         }
