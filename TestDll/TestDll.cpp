@@ -93,7 +93,9 @@ namespace
     constexpr int kRenderViewDrawViewModel = 1 << 0;
     constexpr int kRenderViewDrawHud = 1 << 1;
 
-    std::atomic<ViewMode> g_viewMode{ ViewMode::Off };
+    // Rear view is enabled by default for the first runtime diagnostic.
+    std::atomic<ViewMode> g_viewMode{ ViewMode::Rear };
+    std::atomic<std::uint64_t> g_renderViewCalls{ 0 };
     RenderViewFn g_originalRenderView = nullptr;
     void** g_renderViewSlot = nullptr;
     thread_local bool g_renderingSecondaryView = false;
@@ -132,8 +134,9 @@ namespace
             return;
 
         original(client, view, clearFlags, whatToDraw);
+        g_renderViewCalls.fetch_add(1, std::memory_order_relaxed);
 
-        if (g_renderingSecondaryView || (whatToDraw & kRenderViewDrawHud) == 0)
+        if (g_renderingSecondaryView)
             return;
 
         UpdateViewMode();
@@ -258,7 +261,41 @@ namespace
 
     DWORD WINAPI Initialize(void*)
     {
-        InstallHook();
+        if (InstallHook())
+        {
+            MessageBoxA(
+                nullptr,
+                "VClient017 a ete trouve et l'entree RenderView 27 a ete accrochee.",
+                "TestDll - etape 1/2",
+                MB_OK | MB_ICONINFORMATION);
+
+            Sleep(250);
+            if (g_renderViewCalls.load(std::memory_order_relaxed) != 0)
+            {
+                MessageBoxA(
+                    nullptr,
+                    "Le hook RenderView recoit bien les appels du moteur.\n"
+                    "La vue arriere est activee par defaut pour ce test.",
+                    "TestDll - etape 2/2",
+                    MB_OK | MB_ICONINFORMATION);
+            }
+            else
+            {
+                MessageBoxA(
+                    nullptr,
+                    "La vtable a ete modifiee, mais RenderView n'a recu aucun appel.",
+                    "TestDll - diagnostic",
+                    MB_OK | MB_ICONWARNING);
+            }
+        }
+        else
+        {
+            MessageBoxA(
+                nullptr,
+                "Echec de l'installation du hook VClient017::RenderView.",
+                "TestDll - erreur",
+                MB_OK | MB_ICONERROR);
+        }
         return 0;
     }
 }
